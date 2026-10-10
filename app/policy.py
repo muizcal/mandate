@@ -13,14 +13,19 @@ class Policy(BaseModel):
     monthly_budget: Decimal = Decimal("1000")
     per_order_limit: Decimal = Decimal("300")
     approval_threshold: Decimal = Decimal("100")
-    allowed_categories: set[str] = Field(
-        default={"office supplies", "cleaning", "packaging"})
+    # Matched against EVERY level of a product's category path, so "office supplies"
+    # allows everything under it, while "batteries" allows batteries without
+    # allowing all of Electronics.
+    allowed_categories: set[str] = Field(default={
+        "office supplies", "household cleaning supplies",
+        "household paper products", "batteries"})
     blocked_merchants: set[str] = Field(default_factory=set)
 
 
 class CartItem(BaseModel):
     name: str
-    category: str
+    category: str                                   # display text
+    category_path: list[str] = Field(default_factory=list)
     merchant: str
     unit_price: Decimal
     quantity: int = 1
@@ -36,6 +41,10 @@ def cart_total(items: list[CartItem]) -> Decimal:
     return sum((i.unit_price * i.quantity for i in items), Decimal("0"))
 
 
+def _segments(item: CartItem) -> set[str]:
+    return {s.strip().lower() for s in (item.category_path or [item.category])}
+
+
 def evaluate(policy: Policy, items: list[CartItem],
              spent_this_month: Decimal = Decimal("0")) -> PolicyResult:
     total = cart_total(items)
@@ -44,7 +53,7 @@ def evaluate(policy: Policy, items: list[CartItem],
     if not items:
         deny.append("Cart is empty")
     for i in items:
-        if i.category.lower() not in policy.allowed_categories:
+        if not (_segments(i) & policy.allowed_categories):
             deny.append(f"Category '{i.category}' is not allowed ({i.name})")
         if i.merchant in policy.blocked_merchants:
             deny.append(f"Merchant '{i.merchant}' is blocked")

@@ -1,4 +1,7 @@
+fastapi
+uvicorn
 httpx
 python-dotenv
 pydantic
+google-genai
 pytest

@@ -1,4 +1,4 @@
-import hashlib, os, time, uuid
+import hashlib, os, re, threading, time, uuid
 from decimal import Decimal
 
 from dotenv import load_dotenv
@@ -11,15 +11,39 @@ from app.paypal_client import PayPalClient
 from app.policy import Decision, Policy, evaluate
 
 load_dotenv()
-MODEL = os.environ["GEMINI_MODEL"]
 MAX_STEPS = 12
-client = genai.Client()
+MAX_SEARCHES = 6
+MIN_INTERVAL = float(os.getenv("GEMINI_MIN_INTERVAL", "5"))  # seconds between model calls
+
+_client = None
+_throttle_lock = threading.Lock()
+_last_call = 0.0
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client()          # reads GEMINI_API_KEY
+    return _client
+
+
+def _model() -> str:
+    m = os.getenv("GEMINI_MODEL")
+    if not m:
+        raise RuntimeError("Set GEMINI_MODEL in .env (run list_models.py to see options).")
+    return m
+
+
+class QuotaExhausted(RuntimeError):
+    pass
+
 
 DECLS = [
     types.FunctionDeclaration(
         name="search_products",
         description="Search the product catalog. Returns in-stock products with "
-                    "their cheapest price. Call once per item the owner wants.",
+                    "their cheapest price and category path. Call it ONCE per item "
+                    "the owner wants. You may call it for several items in the same step.",
         parameters=types.Schema(type="OBJECT", properties={
             "query": types.Schema(type="STRING",
                                   description="Specific product search text")},
@@ -48,18 +72,29 @@ def system_prompt(p: Policy) -> str:
     return f"""You are Mandate, a purchasing agent for a small business owner.
 
 Process:
-1. For each item the owner wants, call search_products with a specific query.
-2. Pick relevant products only. Results are noisy: ignore wrong items,
-   novelty/seasonal products, and bulk or pallet listings far above a normal
-   price. Prefer the cheapest relevant option.
-3. Call propose_cart with product_ids from the search results and quantities.
+1. Search ONCE per item the owner wants, and issue all the searches together in
+   the same step. Never search again just to change a quantity: quantity is
+   your choice when you propose the cart, it is not something a search can
+   change. Only re-search if a search returned nothing relevant.
+2. Pick relevant products only. Results are noisy: ignore wrong items (for
+   example a vehicle-cleaning wipe is not an office disinfectant), novelty or
+   seasonal products, and bulk or pallet listings far above a normal price.
+   Prefer the cheapest relevant option. Read titles for pack sizes (e.g. a
+   24-pack) and choose quantities so the total units match the request.
+3. Each product shows its category path. The owner only allows the categories
+   listed below. A product is allowed if ANY level of its category path matches
+   an allowed category. Prefer products that match. Never pick a product just
+   because it is cheap if its category is not allowed.
+4. Call propose_cart with product_ids from the search results and quantities.
    Never invent ids or prices.
-4. If the decision is "deny", read the reasons. If you can fix it (smaller
-   quantity, cheaper item) re-propose, at most twice. Otherwise explain to the
-   owner and stop.
-5. If "allow" or "needs_approval", call submit_for_payment. For needs_approval
+5. If the decision is "deny", read the reasons. If you can fix it (smaller
+   quantity, cheaper item, a product in an allowed category) re-propose, at
+   most twice. Otherwise explain to the owner and stop.
+6. If "allow" or "needs_approval", call submit_for_payment. For needs_approval
    the owner is asked inside that tool.
-6. Report honestly using only tool results. Never say a purchase happened
+7. If the request is too vague to search for, or nothing relevant exists, say so
+   plainly instead of guessing.
+8. Report honestly using only tool results. Never say a purchase happened
    unless submit_for_payment returned status "order_created".
 
 The owner's limits (enforced by code, not by you): per-order limit
@@ -75,6 +110,7 @@ class Session:
         self.ask_owner = ask_owner or (lambda summary: False)
         self.paypal = paypal or PayPalClient()
         self.catalog, self.cart, self.result, self.order = {}, None, None, None
+        self.searches = 0
 
     def log(self, event: str, **data):
         db.add_event(self.id, event, data)
@@ -86,6 +122,12 @@ class Session:
 
     # ---- tools -------------------------------------------------------
     def t_search_products(self, query: str):
+        if self.searches >= MAX_SEARCHES:
+            self.log("search_limit", query=query)
+            return {"error": "Search limit reached. Call propose_cart now with "
+                             "the products you already have, or explain that "
+                             "nothing suitable was found."}
+        self.searches += 1
         try:
             results = search_products(query, limit=6)
         except Exception as e:
@@ -151,14 +193,43 @@ class Session:
             return {"error": f"{name} failed: {e}"}
 
 
-def _generate(contents, config, retries=5):
+def _throttle():
+    """Space out model calls across ALL sessions so we stay under the rate limit."""
+    global _last_call
+    with _throttle_lock:
+        wait = _last_call + MIN_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call = time.time()
+
+
+def _retry_delay(text: str) -> float | None:
+    m = (re.search(r"retry in ([\d.]+)\s*s", text, re.I)
+         or re.search(r"retryDelay\W+([\d.]+)s", text))
+    return float(m.group(1)) if m else None
+
+
+def _generate(contents, config, retries=6):
     for attempt in range(retries):
+        _throttle()
         try:
-            return client.models.generate_content(
-                model=MODEL, contents=contents, config=config)
+            return _get_client().models.generate_content(
+                model=_model(), contents=contents, config=config)
         except errors.APIError as e:
-            if e.code in (429, 500, 503) and attempt < retries - 1:
-                time.sleep(min(2 ** attempt * 2, 30))
+            text = str(e)
+            if e.code == 429 and ("PerDay" in text or "per day" in text.lower()):
+                raise QuotaExhausted(
+                    "Gemini's daily free-tier quota for this model is used up. "
+                    "Try again later, or set a different GEMINI_MODEL.") from e
+            if e.code in (429, 500, 503):
+                if attempt == retries - 1:
+                    if e.code == 429:
+                        raise QuotaExhausted(
+                            "Gemini is rate-limiting the free tier. "
+                            "Wait a minute and try again.") from e
+                    raise
+                delay = _retry_delay(text) if e.code == 429 else None
+                time.sleep(min(delay + 1 if delay else 2 ** attempt * 2, 65))
                 continue
             raise
 
@@ -172,8 +243,10 @@ def run_agent(goal: str, session: Session) -> str:
     contents = [types.Content(role="user", parts=[types.Part(text=goal)])]
     session.log("goal", goal=goal)
 
-    for _ in range(MAX_STEPS):
+    for step in range(1, MAX_STEPS + 1):
+        t0 = time.time()
         resp = _generate(contents, config)
+        session.log("model_call", step=step, seconds=round(time.time() - t0, 1))
         if not resp.candidates or not resp.candidates[0].content:
             return "The model returned no content."
         contents.append(resp.candidates[0].content)   # echo back unchanged

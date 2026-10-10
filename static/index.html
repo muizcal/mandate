@@ -58,6 +58,13 @@
   .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
   .toolbar input { max-width:320px; min-width:160px; padding:6px 10px; }
   #err { color:#b42318; margin-top:8px; }
+  .detail { margin-top:12px; border:1px solid var(--line); border-radius:8px; background:#fbfcfe; }
+  .detail-head { display:flex; gap:10px; align-items:center; padding:8px 12px;
+                 border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .detail-head b { font-size:13px; }
+  .detail-head .spacer { margin-left:auto; display:flex; gap:6px; }
+  .detail pre { margin:0; padding:12px; white-space:pre-wrap; word-break:break-word;
+                max-height:340px; overflow:auto; font:13px/1.5 ui-monospace,Consolas,monospace; }
 </style>
 </head>
 <body>
@@ -127,8 +134,21 @@
     <div class="toolbar">
       <input type="text" id="auditFilter" placeholder="Filter by session id, event, text…">
       <button class="ghost" type="button" id="clearFilter">Show all</button>
+      <span class="muted">Click any row to read the full detail below.</span>
     </div>
     <div id="audit" style="height:380px"></div>
+
+    <div class="detail" id="detail" hidden>
+      <div class="detail-head">
+        <b id="dEvent"></b>
+        <span class="muted" id="dMeta"></span>
+        <span class="spacer">
+          <button class="ghost" type="button" id="dCopy">Copy</button>
+          <button class="ghost" type="button" id="dClose">Close</button>
+        </span>
+      </div>
+      <pre id="dText"></pre>
+    </div>
   </section>
 </main>
 
@@ -147,9 +167,11 @@ const STATUS = {
   declined: "Declined by owner", cancelled: "Cancelled", error: "Error",
   no_purchase: "No purchase", payment_failed: "Payment failed",
 };
-const BAD_EVENTS = ["submit_blocked", "error", "tool_error", "search_error", "approval_timeout"];
+const BAD_EVENTS = ["submit_blocked", "error", "tool_error", "search_error",
+                    "approval_timeout", "search_limit", "max_steps_reached"];
 const GOOD_EVENTS = ["order_created", "captured"];
 let selectedSid = "";
+let selectedEventId = null;
 
 function summarize(e) {
   const d = e.data || {};
@@ -157,6 +179,7 @@ function summarize(e) {
     case "goal": return d.goal;
     case "search": return `Searched "${d.query}" → ${d.found} in-stock products`;
     case "search_error": return `Search failed: ${d.error}`;
+    case "search_limit": return `Search limit reached (skipped "${d.query}")`;
     case "propose_cart":
       return `${(d.decision || "").toUpperCase()} · ${money(d.total)} · ${(d.reasons || []).join("; ")}`;
     case "approval_requested": return "Owner approval requested";
@@ -169,12 +192,45 @@ function summarize(e) {
     case "final": return d.text;
     case "tool_error": return `${d.tool || ""}: ${d.error}`;
     case "error": return d.error;
+    case "max_steps_reached": return "Stopped: too many steps without finishing";
     default: return JSON.stringify(d);
   }
 }
 
+function fullText(row) {
+  const d = row.raw || {};
+  if (row.event === "final") return d.text || "";
+  if (row.event === "goal") return d.goal || "";
+  if (row.event === "error" || row.event === "search_error") return String(d.error || "");
+  return row.detail + "\n\n" + JSON.stringify(d, null, 2);
+}
+
+function showDetail(row) {
+  $("dEvent").textContent = row.event;
+  $("dMeta").textContent = `${fmtTime(row.ts)} · session ${row.session_id}`;
+  $("dText").textContent = fullText(row);
+  $("detail").hidden = false;
+  $("detail").scrollIntoView({block: "nearest", behavior: "smooth"});
+}
+$("dClose").addEventListener("click", () => {
+  $("detail").hidden = true;
+  selectedEventId = null;
+  auditGrid.redrawRows();
+});
+$("dCopy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("dText").textContent);
+    $("dCopy").textContent = "Copied";
+    setTimeout(() => { $("dCopy").textContent = "Copy"; }, 1200);
+  } catch (e) { /* clipboard unavailable */ }
+});
+
+//Tooltips: stay open while the cursor is on them, and linger.
+const TOOLTIP = {tooltipShowDelay: 300, tooltipHideDelay: 60000, tooltipInteraction: true};
+
 //AG Grid: sessions 
 const sessionGrid = agGrid.createGrid($("sessions"), {
+  ...TOOLTIP,
   getRowId: (p) => p.data.id,
   rowData: [],
   defaultColDef: {sortable: true, resizable: true, filter: true},
@@ -203,11 +259,13 @@ const sessionGrid = agGrid.createGrid($("sessions"), {
   },
 });
 
-//AG Grid: audit log 
+// AG Grid: audit log 
 const auditGrid = agGrid.createGrid($("audit"), {
+  ...TOOLTIP,
   getRowId: (p) => String(p.data.id),
   rowData: [],
   defaultColDef: {sortable: true, resizable: true, filter: true},
+  rowClassRules: {"row-selected": (p) => p.data && String(p.data.id) === String(selectedEventId)},
   columnDefs: [
     {headerName: "Time", field: "ts", width: 160, sort: "desc",
      valueFormatter: (p) => fmtTime(p.value)},
@@ -221,6 +279,11 @@ const auditGrid = agGrid.createGrid($("audit"), {
     {headerName: "Detail", field: "detail", flex: 1, minWidth: 300, tooltipField: "detail"},
     {headerName: "Goal", field: "goal", width: 220, tooltipField: "goal"},
   ],
+  onRowClicked: (e) => {
+    selectedEventId = e.data.id;
+    auditGrid.redrawRows();
+    showDetail(e.data);
+  },
 });
 
 $("auditFilter").addEventListener("input", (e) => {
@@ -234,7 +297,7 @@ $("clearFilter").addEventListener("click", () => {
   sessionGrid.redrawRows();
 });
 
-// API
+//API 
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -298,6 +361,7 @@ async function refresh() {
     auditGrid.setGridOption("rowData", events.map((e) => ({
       id: e.id, ts: e.ts, session_id: e.session_id, event: e.event,
       detail: summarize(e), goal: e.goal, decision: (e.data || {}).decision,
+      raw: e.data,
     })));
     renderSummary(summary);
     renderApproval(sessions);
