@@ -1,7 +1,8 @@
 import threading
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from app import db
@@ -11,6 +12,7 @@ from app.policy import Decision, Policy
 
 app = FastAPI(title="Mandate")
 
+STATIC = Path(__file__).resolve().parent.parent / "static"
 POLICY = Policy()
 PAYPAL = PayPalClient()
 PENDING: dict[str, dict] = {}     # session_id -> {"event": Event, "approved": bool|None}
@@ -62,6 +64,17 @@ def _worker(session: Session, goal: str):
         db.update_session(sid, status="error", final_text=f"Agent error: {e}")
 
 
+@app.get("/")
+def dashboard():
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/api/summary")
+def summary():
+    return {"spent": str(db.spent_this_month()),
+            "policy": POLICY.model_dump(mode="json")}
+
+
 @app.post("/api/goals")
 def submit_goal(body: GoalBody):
     session = Session(POLICY, spent_this_month=db.spent_this_month(), paypal=PAYPAL)
@@ -110,7 +123,7 @@ def paypal_return(token: str):
         db.add_event(s["id"], "captured",
                      {"http": cap.get("http"), "status": cap.get("status")})
         db.update_session(s["id"], status="paid" if ok else "payment_failed")
-    return RedirectResponse(f"/api/sessions/{s['id']}")
+    return RedirectResponse("/")
 
 
 @app.get("/paypal/cancel")
@@ -119,4 +132,4 @@ def paypal_cancel(token: str = ""):
     if s:
         db.add_event(s["id"], "buyer_cancelled", {})
         db.update_session(s["id"], status="cancelled")
-    return {"status": "cancelled"}
+    return RedirectResponse("/")

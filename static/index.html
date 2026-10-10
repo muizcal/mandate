@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandate</title>
+<script src="https://cdn.jsdelivr.net/npm/ag-grid-community@36.1.0/dist/ag-grid-community.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#14181f; --muted:#667085;
+          --line:#e4e7ec; --brand:#0b3d91; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { background:var(--brand); color:#fff; padding:16px 24px; display:flex;
+           align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:22px; letter-spacing:.3px; }
+  header .tag { opacity:.85; }
+  header .live { margin-left:auto; font-size:12px; opacity:.9; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:#4ade80; margin-right:6px; }
+  .dot.off { background:#f87171; }
+  main { max-width:1200px; margin:0 auto; padding:20px; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  .muted { color:var(--muted); font-size:12px; }
+  .stats { display:grid; grid-template-columns:2fr 1fr 1fr; gap:16px; }
+  @media (max-width:800px) { .stats { grid-template-columns:1fr; } }
+  .big { font-size:26px; font-weight:700; }
+  .bar { height:8px; background:#eaecf0; border-radius:99px; overflow:hidden; margin-top:8px; }
+  .bar > i { display:block; height:100%; width:0; background:var(--brand); transition:width .4s; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .chip { background:#eef2fb; color:var(--brand); border-radius:99px; padding:2px 10px; font-size:12px; }
+  form { display:flex; gap:8px; flex-wrap:wrap; }
+  input[type=text] { flex:1; min-width:240px; padding:10px 12px; border:1px solid var(--line);
+                     border-radius:8px; font:inherit; }
+  button { padding:10px 16px; border:0; border-radius:8px; background:var(--brand);
+           color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:#eef2fb; color:var(--brand); padding:4px 10px; font-weight:500;
+                 font-size:12px; }
+  button.no { background:#b42318; }
+  .examples { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  #approval { border:2px solid #f79009; background:#fffaeb; }
+  #approval pre { background:#fff; border:1px solid var(--line); border-radius:8px;
+                  padding:10px; white-space:pre-wrap; margin:8px 0; font:13px/1.4 ui-monospace,Consolas,monospace; }
+  #approval .actions { display:flex; gap:8px; }
+  .badge { padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600;
+           background:#eaecf0; color:#344054; }
+  .badge.running { background:#dbeafe; color:#1d4ed8; }
+  .badge.awaiting_approval { background:#fef0c7; color:#b54708; }
+  .badge.awaiting_payment { background:#ede9fe; color:#6d28d9; }
+  .badge.paid { background:#d1fadf; color:#067647; }
+  .badge.denied, .badge.error, .badge.payment_failed { background:#fee4e2; color:#b42318; }
+  .ev-bad { color:#b42318; font-weight:600; }
+  .ev-good { color:#067647; font-weight:600; }
+  .row-selected { background:#eef2fb !important; }
+  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .toolbar input { max-width:320px; min-width:160px; padding:6px 10px; }
+  #err { color:#b42318; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mandate</h1>
+  <span class="tag">An AI purchasing agent that can only spend what you've authorized.</span>
+  <span class="live"><span class="dot" id="dot"></span><span id="liveText">Live</span></span>
+</header>
+
+<main>
+  <section class="stats">
+    <div class="card">
+      <div class="muted">Spent this month</div>
+      <div class="big"><span id="spent">$0.00</span> <span class="muted">of <span id="budget">$0</span></span></div>
+      <div class="bar"><i id="bar"></i></div>
+    </div>
+    <div class="card">
+      <div class="muted">Per-order limit</div>
+      <div class="big" id="limit">$0</div>
+      <div class="muted">Hard stop above this</div>
+    </div>
+    <div class="card">
+      <div class="muted">Approval needed above</div>
+      <div class="big" id="threshold">$0</div>
+      <div class="muted">Owner must confirm</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>What should Mandate buy?</h2>
+    <form id="goalForm">
+      <input type="text" id="goal" placeholder="e.g. Buy 12 reams of 8.5x11 printer paper"
+             maxlength="500" autocomplete="off" required>
+      <button id="goBtn" type="submit">Run agent</button>
+    </form>
+    <div class="examples">
+      <span class="muted">Try:</span>
+      <button class="ghost" type="button" data-ex="Buy 2 reams of 8.5x11 printer paper">Within limits</button>
+      <button class="ghost" type="button" data-ex="Buy 12 reams of 8.5x11 printer paper">Needs approval</button>
+      <button class="ghost" type="button" data-ex="Buy a gaming laptop">Should be denied</button>
+    </div>
+    <div class="muted" style="margin-top:8px">Allowed categories: <span class="chips" id="cats" style="display:inline-flex"></span></div>
+    <div id="err"></div>
+  </section>
+
+  <section class="card" id="approval" hidden>
+    <h2>Approval needed</h2>
+    <div class="muted" id="apGoal"></div>
+    <pre id="apSummary"></pre>
+    <div class="actions">
+      <button id="apYes" type="button">Approve purchase</button>
+      <button id="apNo" type="button" class="no">Decline</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Agent sessions</h2>
+    <div id="sessions" style="height:300px"></div>
+    <div class="muted" style="margin-top:6px">
+      Click a row to filter the audit log. Right-click a Pay link and open it in a private
+      window, then log in as your sandbox <b>buyer</b> account.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Audit log</h2>
+    <div class="toolbar">
+      <input type="text" id="auditFilter" placeholder="Filter by session id, event, text…">
+      <button class="ghost" type="button" id="clearFilter">Show all</button>
+    </div>
+    <div id="audit" style="height:380px"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const money = (v) => (v === null || v === undefined || v === "") ? ""
+  : "$" + Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleString([],
+  {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"});
+
+const STATUS = {
+  running: "Running", awaiting_approval: "Awaiting approval",
+  awaiting_payment: "Awaiting payment", paid: "Paid", denied: "Denied by policy",
+  declined: "Declined by owner", cancelled: "Cancelled", error: "Error",
+  no_purchase: "No purchase", payment_failed: "Payment failed",
+};
+const BAD_EVENTS = ["submit_blocked", "error", "tool_error", "search_error", "approval_timeout"];
+const GOOD_EVENTS = ["order_created", "captured"];
+let selectedSid = "";
+
+function summarize(e) {
+  const d = e.data || {};
+  switch (e.event) {
+    case "goal": return d.goal;
+    case "search": return `Searched "${d.query}" → ${d.found} in-stock products`;
+    case "search_error": return `Search failed: ${d.error}`;
+    case "propose_cart":
+      return `${(d.decision || "").toUpperCase()} · ${money(d.total)} · ${(d.reasons || []).join("; ")}`;
+    case "approval_requested": return "Owner approval requested";
+    case "owner_decision": return d.approved ? "Owner approved" : "Owner declined";
+    case "approval_timeout": return "Approval timed out, treated as declined";
+    case "submit_blocked": return `Blocked: ${(d.reasons || []).join("; ")}`;
+    case "order_created": return `PayPal order ${d.order_id} created for ${money(d.total)}`;
+    case "captured": return `Capture ${d.status} (HTTP ${d.http})`;
+    case "buyer_cancelled": return "Buyer cancelled at PayPal";
+    case "final": return d.text;
+    case "tool_error": return `${d.tool || ""}: ${d.error}`;
+    case "error": return d.error;
+    default: return JSON.stringify(d);
+  }
+}
+
+//AG Grid: sessions 
+const sessionGrid = agGrid.createGrid($("sessions"), {
+  getRowId: (p) => p.data.id,
+  rowData: [],
+  defaultColDef: {sortable: true, resizable: true, filter: true},
+  rowClassRules: {"row-selected": (p) => p.data && p.data.id === selectedSid},
+  columnDefs: [
+    {headerName: "Time", field: "created_at", width: 160, sort: "desc",
+     valueFormatter: (p) => fmtTime(p.value)},
+    {headerName: "Goal", field: "goal", flex: 2, minWidth: 220, tooltipField: "goal"},
+    {headerName: "Status", field: "status", width: 190,
+     cellRenderer: (p) => `<span class="badge ${esc(p.value)}">${esc(STATUS[p.value] || p.value)}</span>`},
+    {headerName: "Total", field: "total", width: 110, type: "rightAligned",
+     valueFormatter: (p) => money(p.value)},
+    {headerName: "PayPal order", field: "order_id", width: 170},
+    {headerName: "Action", field: "approve_url", width: 150, sortable: false, filter: false,
+     cellRenderer: (p) => {
+       const ok = p.data.status === "awaiting_payment" && p.value &&
+                  String(p.value).startsWith("https://www.sandbox.paypal.com/");
+       return ok ? `<a href="${esc(p.value)}" target="_blank" rel="noopener">Pay as buyer ↗</a>` : "";
+     }},
+  ],
+  onRowClicked: (e) => {
+    selectedSid = e.data.id;
+    $("auditFilter").value = selectedSid;
+    auditGrid.setGridOption("quickFilterText", selectedSid);
+    sessionGrid.redrawRows();
+  },
+});
+
+//AG Grid: audit log 
+const auditGrid = agGrid.createGrid($("audit"), {
+  getRowId: (p) => String(p.data.id),
+  rowData: [],
+  defaultColDef: {sortable: true, resizable: true, filter: true},
+  columnDefs: [
+    {headerName: "Time", field: "ts", width: 160, sort: "desc",
+     valueFormatter: (p) => fmtTime(p.value)},
+    {headerName: "Session", field: "session_id", width: 110},
+    {headerName: "Event", field: "event", width: 170,
+     cellClassRules: {
+       "ev-bad": (p) => BAD_EVENTS.includes(p.value) ||
+                        (p.value === "propose_cart" && p.data.decision === "deny"),
+       "ev-good": (p) => GOOD_EVENTS.includes(p.value),
+     }},
+    {headerName: "Detail", field: "detail", flex: 1, minWidth: 300, tooltipField: "detail"},
+    {headerName: "Goal", field: "goal", width: 220, tooltipField: "goal"},
+  ],
+});
+
+$("auditFilter").addEventListener("input", (e) => {
+  auditGrid.setGridOption("quickFilterText", e.target.value);
+  if (!e.target.value) { selectedSid = ""; sessionGrid.redrawRows(); }
+});
+$("clearFilter").addEventListener("click", () => {
+  $("auditFilter").value = "";
+  selectedSid = "";
+  auditGrid.setGridOption("quickFilterText", "");
+  sessionGrid.redrawRows();
+});
+
+// API
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+function renderSummary(s) {
+  const p = s.policy, spent = Number(s.spent), budget = Number(p.monthly_budget);
+  $("spent").textContent = money(spent);
+  $("budget").textContent = money(budget);
+  $("limit").textContent = money(p.per_order_limit);
+  $("threshold").textContent = money(p.approval_threshold);
+  $("bar").style.width = Math.min(100, budget ? (spent / budget) * 100 : 0) + "%";
+  const cats = $("cats");
+  cats.replaceChildren(...[...p.allowed_categories].sort().map((c) => {
+    const el = document.createElement("span");
+    el.className = "chip";
+    el.textContent = c;
+    return el;
+  }));
+}
+
+function renderApproval(sessions) {
+  const s = sessions.find((x) => x.status === "awaiting_approval");
+  const box = $("approval");
+  if (!s) { box.hidden = true; box.dataset.sid = ""; return; }
+  box.hidden = false;
+  if (box.dataset.sid !== s.id) {
+    box.dataset.sid = s.id;
+    $("apGoal").textContent = "Request: " + s.goal;
+    $("apSummary").textContent = s.approval_summary || "";
+    $("apYes").disabled = false;
+    $("apNo").disabled = false;
+  }
+}
+
+async function decide(approve) {
+  const sid = $("approval").dataset.sid;
+  if (!sid) return;
+  $("apYes").disabled = true;
+  $("apNo").disabled = true;
+  try {
+    await api(`/api/sessions/${sid}/decision`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({approve}),
+    });
+  } catch (e) { console.error(e); }
+  refresh();
+}
+$("apYes").addEventListener("click", () => decide(true));
+$("apNo").addEventListener("click", () => decide(false));
+
+let busy = false;
+async function refresh() {
+  if (busy) return;
+  busy = true;
+  try {
+    const [sessions, events, summary] = await Promise.all(
+      [api("/api/sessions"), api("/api/events"), api("/api/summary")]);
+    sessionGrid.setGridOption("rowData", sessions);
+    auditGrid.setGridOption("rowData", events.map((e) => ({
+      id: e.id, ts: e.ts, session_id: e.session_id, event: e.event,
+      detail: summarize(e), goal: e.goal, decision: (e.data || {}).decision,
+    })));
+    renderSummary(summary);
+    renderApproval(sessions);
+    $("dot").classList.remove("off");
+    $("liveText").textContent = "Live";
+  } catch (e) {
+    $("dot").classList.add("off");
+    $("liveText").textContent = "Offline";
+  } finally { busy = false; }
+}
+
+$("goalForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const goal = $("goal").value.trim();
+  if (!goal) return;
+  $("goBtn").disabled = true;
+  $("err").textContent = "";
+  try {
+    await api("/api/goals", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({goal}),
+    });
+    $("goal").value = "";
+    refresh();
+  } catch (e) {
+    $("err").textContent = "Could not start the agent: " + e.message;
+  } finally { $("goBtn").disabled = false; }
+});
+
+document.querySelectorAll("[data-ex]").forEach((b) =>
+  b.addEventListener("click", () => { $("goal").value = b.dataset.ex; $("goal").focus(); }));
+
+setInterval(refresh, 2000);
+refresh();
+</script>
+</body>
+</html>
