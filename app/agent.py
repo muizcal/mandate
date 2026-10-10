@@ -1,10 +1,11 @@
-import hashlib, json, os, time, uuid
+import hashlib, os, time, uuid
 from decimal import Decimal
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
 
+from app import db
 from app.catalog import search_products, to_cart_item
 from app.paypal_client import PayPalClient
 from app.policy import Decision, Policy, evaluate
@@ -74,13 +75,9 @@ class Session:
         self.ask_owner = ask_owner or (lambda summary: False)
         self.paypal = paypal or PayPalClient()
         self.catalog, self.cart, self.result, self.order = {}, None, None, None
-        self.audit = []
 
     def log(self, event: str, **data):
-        rec = {"ts": time.time(), "session": self.id, "event": event, **data}
-        self.audit.append(rec)
-        with open("audit.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
+        db.add_event(self.id, event, data)
 
     def describe(self) -> str:
         lines = [f"{i.quantity} x {i.name[:60]} ({i.merchant}) @ ${i.unit_price}"
@@ -135,7 +132,8 @@ class Session:
         self.order = self.paypal.create_order(
             self.result.total, self.describe().replace("\n", "; "), key)
         self.log("order_created", order_id=self.order["id"],
-                 total=str(self.result.total))
+                 total=str(self.result.total),
+                 approve_url=self.order["approve_url"])
         return {"status": "order_created", "order_id": self.order["id"],
                 "total": str(self.result.total),
                 "note": "Buyer still has to approve the payment in PayPal."}

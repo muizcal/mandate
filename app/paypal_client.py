@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 BASE = "https://api-m.sandbox.paypal.com"
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
 
 
 class PayPalClient:
@@ -45,8 +46,8 @@ class PayPalClient:
                 "description": description[:127],
                 "amount": {"currency_code": "USD", "value": f"{amount:.2f}"}}],
             "payment_source": {"paypal": {"experience_context": {
-                "return_url": "https://example.com/return",
-                "cancel_url": "https://example.com/cancel",
+                "return_url": f"{APP_BASE_URL}/paypal/return",
+                "cancel_url": f"{APP_BASE_URL}/paypal/cancel",
                 "user_action": "PAY_NOW"}}},
         }
         r = self._request("POST", "/v2/checkout/orders",
