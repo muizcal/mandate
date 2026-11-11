@@ -1,19 +1,56 @@
+import os
 import threading
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from decimal import Decimal
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 from app import db
 from app.agent import Session, run_agent
 from app.paypal_client import PayPalClient
 from app.policy import Decision, Policy
 
-app = FastAPI(title="Mandate")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Sessions that were mid-run when the server stopped can never finish.
+    with db.conn() as c:
+        c.execute("UPDATE sessions SET status='error', "
+                  "final_text='Interrupted by a server restart' "
+                  "WHERE status IN ('running','awaiting_approval')")
+    yield
+
+
+app = FastAPI(title="Mandate", lifespan=lifespan)
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-POLICY = Policy()
+MAX_GOALS_PER_HOUR = int(os.getenv("MAX_GOALS_PER_HOUR", "30"))
+MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "2"))
+_goal_times: deque = deque()
+_goal_lock = threading.Lock()
+
+
+def build_policy() -> Policy:
+    """Defaults live in policy.py; any limit can be overridden from .env."""
+    overrides = {}
+    for env_name, field in (("MONTHLY_BUDGET", "monthly_budget"),
+                            ("PER_ORDER_LIMIT", "per_order_limit"),
+                            ("APPROVAL_THRESHOLD", "approval_threshold")):
+        value = os.getenv(env_name)
+        if value:
+            overrides[field] = Decimal(value)
+    return Policy(**overrides)
+
+
+POLICY = build_policy()
 PAYPAL = PayPalClient()
 PENDING: dict[str, dict] = {}     # session_id -> {"event": Event, "approved": bool|None}
 APPROVAL_TIMEOUT = 600            # seconds the agent waits for the owner
@@ -25,6 +62,22 @@ class GoalBody(BaseModel):
 
 class DecisionBody(BaseModel):
     approve: bool
+
+
+def check_capacity():
+    """Protects the shared Gemini quota when the demo is public."""
+    now = time.time()
+    with _goal_lock:
+        while _goal_times and now - _goal_times[0] > 3600:
+            _goal_times.popleft()
+        if len(_goal_times) >= MAX_GOALS_PER_HOUR:
+            raise HTTPException(429, "This demo is rate-limited. Please try again later.")
+        active = [s for s in db.list_sessions(50)
+                  if s["status"] in ("running", "awaiting_approval")]
+        if len(active) >= MAX_ACTIVE_SESSIONS:
+            raise HTTPException(429, "Other requests are still running. "
+                                     "Please wait for one to finish.")
+        _goal_times.append(now)
 
 
 def make_ask_owner(sid: str):
@@ -69,6 +122,11 @@ def dashboard():
     return FileResponse(STATIC / "index.html")
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/api/summary")
 def summary():
     return {"spent": str(db.spent_this_month()),
@@ -77,6 +135,7 @@ def summary():
 
 @app.post("/api/goals")
 def submit_goal(body: GoalBody):
+    check_capacity()
     session = Session(POLICY, spent_this_month=db.spent_this_month(), paypal=PAYPAL)
     session.ask_owner = make_ask_owner(session.id)
     db.create_session(session.id, body.goal)

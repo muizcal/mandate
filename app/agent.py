@@ -1,6 +1,7 @@
 import hashlib, os, re, threading, time, uuid
 from decimal import Decimal
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
@@ -13,7 +14,11 @@ from app.policy import Decision, Policy, evaluate
 load_dotenv()
 MAX_STEPS = 12
 MAX_SEARCHES = 6
-MIN_INTERVAL = float(os.getenv("GEMINI_MIN_INTERVAL", "5"))  # seconds between model calls
+NET_RETRIES = 3                       # attempts for network errors
+HTTP_TIMEOUT_MS = 45_000              # per Gemini request
+SESSION_TIMEOUT = float(os.getenv("SESSION_TIMEOUT", "240"))   # seconds, excl. owner wait
+MIN_INTERVAL = float(os.getenv("GEMINI_MIN_INTERVAL", "5"))    # seconds between model calls
+SERVER_ERRORS = (500, 502, 503, 504)
 
 _client = None
 _throttle_lock = threading.Lock()
@@ -23,18 +28,28 @@ _last_call = 0.0
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client()          # reads GEMINI_API_KEY
+        _client = genai.Client(                      # reads GEMINI_API_KEY
+            http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS))
     return _client
 
 
-def _model() -> str:
-    m = os.getenv("GEMINI_MODEL")
-    if not m:
+def _models() -> list[str]:
+    main = os.getenv("GEMINI_MODEL")
+    if not main:
         raise RuntimeError("Set GEMINI_MODEL in .env (run list_models.py to see options).")
-    return m
+    fallback = os.getenv("GEMINI_FALLBACK_MODEL")
+    return [main] + ([fallback] if fallback and fallback != main else [])
 
 
 class QuotaExhausted(RuntimeError):
+    pass
+
+
+class NetworkUnavailable(RuntimeError):
+    pass
+
+
+class SessionTimeout(RuntimeError):
     pass
 
 
@@ -111,6 +126,11 @@ class Session:
         self.paypal = paypal or PayPalClient()
         self.catalog, self.cart, self.result, self.order = {}, None, None, None
         self.searches = 0
+        self.started = time.time()
+        self.owner_wait = 0.0          # seconds spent waiting on the owner
+
+    def deadline(self) -> float:
+        return self.started + SESSION_TIMEOUT + self.owner_wait
 
     def log(self, event: str, **data):
         db.add_event(self.id, event, data)
@@ -166,7 +186,9 @@ class Session:
             self.log("submit_blocked", reasons=self.result.reasons)
             return {"status": "refused", "reasons": self.result.reasons}
         if decision == Decision.NEEDS_APPROVAL:
+            t0 = time.time()
             approved = bool(self.ask_owner(self.describe()))
+            self.owner_wait += time.time() - t0     # owner's thinking time isn't the agent's
             self.log("owner_decision", approved=approved)
             if not approved:
                 return {"status": "owner_declined"}
@@ -209,29 +231,66 @@ def _retry_delay(text: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def _generate(contents, config, retries=6):
+def _generate(contents, config, session: Session, retries=8):
+    models = _models()
+    idx = 0                    # which model we're using right now
+    net_fails = 0
+    server_fails = 0
+
+    def can_fall_back() -> bool:
+        return idx + 1 < len(models)
+
     for attempt in range(retries):
+        if time.time() > session.deadline():
+            raise SessionTimeout(
+                f"Stopped after {int(SESSION_TIMEOUT)}s without finishing "
+                "(slow network or model). Try again.")
         _throttle()
         try:
             return _get_client().models.generate_content(
-                model=_model(), contents=contents, config=config)
+                model=models[idx], contents=contents, config=config)
         except errors.APIError as e:
             text = str(e)
-            if e.code == 429 and ("PerDay" in text or "per day" in text.lower()):
+            daily = e.code == 429 and ("PerDay" in text or "per day" in text.lower())
+            if daily:
+                if can_fall_back():
+                    idx += 1
+                    session.log("model_fallback", model=models[idx],
+                                reason="daily quota used up")
+                    continue
                 raise QuotaExhausted(
                     "Gemini's daily free-tier quota for this model is used up. "
                     "Try again later, or set a different GEMINI_MODEL.") from e
-            if e.code in (429, 500, 503):
+            if e.code in SERVER_ERRORS:
+                server_fails += 1
+                if server_fails >= 2 and can_fall_back():
+                    idx += 1
+                    server_fails = 0
+                    session.log("model_fallback", model=models[idx],
+                                reason=f"server error {e.code}")
+                    continue
                 if attempt == retries - 1:
-                    if e.code == 429:
-                        raise QuotaExhausted(
-                            "Gemini is rate-limiting the free tier. "
-                            "Wait a minute and try again.") from e
                     raise
-                delay = _retry_delay(text) if e.code == 429 else None
+                time.sleep(min(2 ** server_fails * 2, 20))
+                continue
+            if e.code == 429:
+                if attempt == retries - 1:
+                    raise QuotaExhausted(
+                        "Gemini is rate-limiting the free tier. "
+                        "Wait a minute and try again.") from e
+                delay = _retry_delay(text)
                 time.sleep(min(delay + 1 if delay else 2 ** attempt * 2, 65))
                 continue
             raise
+        except (httpx.TransportError, OSError) as e:
+            # DNS failures, dropped connections, timeouts.
+            net_fails += 1
+            if net_fails >= NET_RETRIES:
+                raise NetworkUnavailable(
+                    "Could not reach Gemini (network or DNS problem, or a "
+                    "timeout). Check your connection and try again.") from e
+            time.sleep(min(2 ** net_fails * 2, 20))
+    raise NetworkUnavailable("Gemini did not respond.")
 
 
 def run_agent(goal: str, session: Session) -> str:
@@ -245,7 +304,7 @@ def run_agent(goal: str, session: Session) -> str:
 
     for step in range(1, MAX_STEPS + 1):
         t0 = time.time()
-        resp = _generate(contents, config)
+        resp = _generate(contents, config, session)
         session.log("model_call", step=step, seconds=round(time.time() - t0, 1))
         if not resp.candidates or not resp.candidates[0].content:
             return "The model returned no content."

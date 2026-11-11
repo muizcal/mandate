@@ -4,7 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 BASE = "https://api-m.sandbox.paypal.com"
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
+APP_BASE_URL = (os.getenv("APP_BASE_URL")
+                or os.getenv("RENDER_EXTERNAL_URL")
+                or "http://localhost:8000").rstrip("/")
 
 
 class PayPalClient:

@@ -7,10 +7,10 @@ load_dotenv()
 URL = "https://api.trychannel3.com/v1/search"
 
 
-def _post(body: dict, retries: int = 5) -> dict:
+def _post(body: dict, retries: int = 3) -> dict:
     for attempt in range(retries):
         try:
-            with httpx.Client(timeout=30) as c:
+            with httpx.Client(timeout=20) as c:
                 r = c.post(URL, json=body, headers={
                     "x-api-key": os.environ["CHANNEL3_API_KEY"],
                     "Content-Type": "application/json"})
