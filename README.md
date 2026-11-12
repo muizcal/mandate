@@ -13,21 +13,29 @@ calling + Channel3 product search + AG Grid.
 
 ## How it works
 
-```mermaid
-flowchart LR
-  O[Owner goal] --> A[Gemini agent loop]
-  A -->|search_products| C[Channel3]
-  A -->|propose_cart| P{Policy engine}
-  P -->|allow| S[submit_for_payment]
-  P -->|needs approval| H[Owner approves in dashboard] --> S
-  P -->|deny| X[Refused with reasons]
-  S --> PP[PayPal order] --> B[Buyer approves in PayPal] --> K[Server captures payment]
-  A -.-> L[(SQLite audit log)]
-  P -.-> L
-  K -.-> L
-  L --> D[AG Grid dashboard]
-```
+```text
+Owner goal ("Buy 24 AA batteries and 2 reams of printer paper")
+     |
+     v
+Gemini agent loop ---- search_products ----> Channel3 (real, in-stock, USD products)
+     |
+     | propose_cart  (product IDs + quantities only)
+     v
+Policy engine (deterministic code, Decimal money)
+     |-- DENY ------------> refused, reasons logged, PayPal never called
+     |-- NEEDS APPROVAL --> owner approves or declines in the dashboard
+     |-- ALLOW -------------+
+     v                      |
+submit_for_payment <--------+
+     |
+     v
+PayPal order created (idempotency key)
+     |
+     v
+Buyer approves in PayPal --> server captures payment --> row becomes "Paid"
 
+Every step is written to the SQLite audit log and shown in the AG Grid dashboard.
+```
 **The model proposes; code decides.** Gemini only picks product IDs and
 quantities.
 
@@ -113,8 +121,14 @@ app/main.py           FastAPI API and PayPal return/cancel handlers
 static/index.html     AG Grid dashboard
 tests/  evals/        offline tests and live evals
 ```
+## Demo
+
+- Hosted demo: https://mandate-czou.onrender.com (free tier: the first load can take up to a minute to wake up)
+- Demo video (under 3 min): https://www.youtube.com/watch?v=W-HkSMAik1E
+- Test payment: use the PayPal sandbox buyer login (email:sb-1hgaa53293779@personal.example.com password:bxB0^D9&)
 
 ## Limitations
+The owner dashboard has no login (demo only). The hosted instance rate-limits requests and its database resets on restart
 
 - **Sandbox only.** No real money moves.
 - PayPal's standard Orders flow requires the buyer to approve each payment, so
